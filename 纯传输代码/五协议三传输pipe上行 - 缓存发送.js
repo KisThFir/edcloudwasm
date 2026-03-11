@@ -402,8 +402,14 @@ const strategyExecutorMap = new Map([
 ]);
 const paramRegex = /(gs5|s5all|ghttp|gnat64|nat64all|httpall|s5|socks|http|ip|nat64)(?:=|:\/\/|%3A%2F%2F)([^&]+)|(proxyall|globalproxy)/gi;
 const establishTcpConnection = async (parsedRequest, request) => {
-    let u = request.url, clean = u.slice(u.indexOf('/', 10) + 1), list = [];
-    if (clean.length < 6) {list.push({type: 0}, {type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost})} else {
+    let u = request.url, clean = u.slice(u.indexOf('/', 10) + 1), l = clean.length, list = [];
+    if (l > 3 && clean.charCodeAt(l - 4) === 47 && clean.charCodeAt(l - 3) === 84 && clean.charCodeAt(l - 2) === 117 && clean.charCodeAt(l - 1) === 110) {
+        clean = clean.slice(0, l - 4);
+    } else {
+        const c = clean.charCodeAt(l - 1);
+        if (c === 47 || c === 61) clean = clean.slice(0, l - 1);
+    }
+    if (l < 6) {list.push({type: 0}, {type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost})} else {
         paramRegex.lastIndex = 0;
         let m, p = Object.create(null);
         while ((m = paramRegex.exec(clean))) p[(m[1] || m[3]).toLowerCase()] = m[2] ? (m[2].charCodeAt(m[2].length - 1) === 61 ? m[2].slice(0, -1) : m[2]) : true;
