@@ -356,9 +356,14 @@ const getUrlParam = (offset, len) => {
     return textDecoder.decode(wasmMem.subarray(dataPtr + offset, dataPtr + offset + len));
 };
 const establishTcpConnection = async (parsedRequest, request) => {
-    const u = request.url, clean = u.slice(u.indexOf('/', 10) + 1);
-    let list = [];
-    if (clean.length < 6) {
+    let u = request.url, clean = u.slice(u.indexOf('/', 10) + 1), l = clean.length, list = [];
+    if (l > 3 && clean.charCodeAt(l - 4) === 47 && clean.charCodeAt(l - 3) === 84 && clean.charCodeAt(l - 2) === 117 && clean.charCodeAt(l - 1) === 110) {
+        clean = clean.slice(0, l - 4);
+    } else {
+        const c = clean.charCodeAt(l - 1);
+        if (c === 47 || c === 61) clean = clean.slice(0, l - 1);
+    }
+    if (l < 6) {
         list.push({type: 0}, {type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost});
     } else {
         const urlBytes = textEncoder.encode(clean);
@@ -501,28 +506,31 @@ const handlePost = async (request) => {
             try {
                 let used = 0, offset = 0;
                 if (isGrpc) {
+                    let grpcBuf = new Uint8Array(0);
                     while (true) {
-                        const {done, value} = await reader.read(new Uint8Array(sessionBuffer, used, used > 0 ? 16384 : 32768));
-                        if (done) break;
-                        sessionBuffer = value.buffer;
-                        const bufToProcess = new Uint8Array(sessionBuffer, 0, used + value.byteLength), bufLen = bufToProcess.byteLength;
-                        offset = 0;
-                        while (bufLen - offset >= 5) {
-                            const grpcLen = ((bufToProcess[offset + 1] << 24) >>> 0) | (bufToProcess[offset + 2] << 16) | (bufToProcess[offset + 3] << 8) | bufToProcess[offset + 4];
-                            const frameSize = 5 + grpcLen;
-                            if (bufLen - offset >= frameSize) {
-                                const grpcData = bufToProcess.subarray(offset + 5, offset + frameSize);
-                                offset += frameSize;
+                        while (grpcBuf.byteLength >= 5) {
+                            const grpcLen = ((grpcBuf[1] << 24) >>> 0) | (grpcBuf[2] << 16) | (grpcBuf[3] << 8) | grpcBuf[4];
+                            if (grpcBuf.byteLength >= 5 + grpcLen) {
+                                const grpcData = grpcBuf.subarray(5, 5 + grpcLen);
+                                grpcBuf = grpcBuf.subarray(5 + grpcLen);
                                 let p = grpcData[0] === 0x0A ? 1 : 0;
                                 while (p && grpcData[p++] & 0x80) ;
                                 const payload = p === 0 ? grpcData : grpcData.subarray(p);
-                                if (payload.length > 0) {state.tcpWriter ? state.tcpWriter(payload) : await handleSession(payload, state, request, writable, close)}
+                                if (payload.length > 0) {
+                                    state.tcpWriter ? state.tcpWriter(payload) : await handleSession(payload, state, request, writable, close);
+                                }
                             } else {break}
                         }
-                        if (offset < bufLen) {
-                            used = bufLen - offset;
-                            new Uint8Array(sessionBuffer).copyWithin(0, offset, bufLen);
-                        } else {used = 0}
+                        const {done, value} = await reader.read(new Uint8Array(sessionBuffer, 0, 32768));
+                        if (done) break;
+                        sessionBuffer = value.buffer;
+                        const chunk = value.slice();
+                        if (grpcBuf.byteLength > 0) {
+                            const combined = new Uint8Array(grpcBuf.byteLength + chunk.byteLength);
+                            combined.set(grpcBuf);
+                            combined.set(chunk, grpcBuf.byteLength);
+                            grpcBuf = combined;
+                        } else {grpcBuf = chunk}
                     }
                 } else {
                     while (true) {
