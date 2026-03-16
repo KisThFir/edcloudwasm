@@ -26,6 +26,8 @@ const flushTime = 20;                 // 20ms
 /**- **警告**: worker最大支持6，超过6没意义*/
 let concurrency = 4;//socket获取并发数
 // ---------------------------------------------------------------------------------
+const urlParamCacheLimit = 20;//URL参数解析结果缓存条数
+// ---------------------------------------------------------------------------------
 //四者的socket获取顺序，全局模式下为这四个的顺序，非全局为：直连>socks>http>turn>nat64>proxyip>finallyProxyHost
 const proxyStrategyOrder = ['socks', 'http', 'turn', 'nat64'];
 const dohEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'];
@@ -475,12 +477,10 @@ const strategyExecutorMap = new Map([
         return concurrentConnect(hostname, port);
     }],
     [1, async ({addrType, port, addrBytes}, param, limit) => {
-        const socksAuth = parseAuthString(param);
-        return connectViaSocksProxy(addrType, port, socksAuth, addrBytes, limit);
+        return connectViaSocksProxy(addrType, port, param, addrBytes, limit);
     }],
     [2, async ({addrType, port, addrBytes}, param, limit) => {
-        const httpAuth = parseAuthString(param);
-        return connectViaHttpProxy(addrType, port, httpAuth, addrBytes, limit);
+        return connectViaHttpProxy(addrType, port, param, addrBytes, limit);
     }],
     [3, async (_parsedRequest, param, limit) => {
         return connectProxyIp(param, limit);
@@ -491,7 +491,6 @@ const strategyExecutorMap = new Map([
     }],
     // @ts-ignore
     [5, async ({addrType, port, addrBytes, isHttp}, param) => {
-        const turnAuth = parseAuthString(param);
         let targetIp = binaryAddrToString(addrType, addrBytes);
         if (isHttp) {
             wasmMem.set(addrBytes, dataPtr);
@@ -503,13 +502,15 @@ const strategyExecutorMap = new Map([
             if (!aRecord) return null;
             targetIp = aRecord.data;
         } else if (addrType === 4) {return null}
-        return connectViaTurnProxy(turnAuth, targetIp, port);
+        return connectViaTurnProxy(param, targetIp, port);
     }]
 ]);
 const getUrlParam = (offset, len) => {
     if (len <= 0) return null;
     return textDecoder.decode(wasmMem.subarray(dataPtr + offset, dataPtr + offset + len));
 };
+const urlListCacheDict = Object.create(null), urlListCacheKeys = new Array(urlParamCacheLimit);
+let urlListCacheIndex = 0;
 const establishTcpConnection = async (parsedRequest, request) => {
     let u = request.url, clean = u.slice(u.indexOf('/', 10) + 1), l = clean.length, list = [];
     if (l > 3 && clean.charCodeAt(l - 4) === 47 && clean.charCodeAt(l - 3) === 84 && clean.charCodeAt(l - 2) === 117 && clean.charCodeAt(l - 1) === 110) {
@@ -518,24 +519,45 @@ const establishTcpConnection = async (parsedRequest, request) => {
         const c = clean.charCodeAt(l - 1);
         if (c === 47 || c === 61) clean = clean.slice(0, l - 1);
     }
-    if (clean.length < 6 || clean.length > 1024) {
-        list.push({type: 0}, {type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost});
+    const cachedList = urlListCacheDict[clean];
+    if (cachedList !== undefined) {
+        list = cachedList;
     } else {
-        const urlBytes = textEncoder.encode(clean);
-        wasmMem.set(urlBytes, dataPtr);
-        parseUrlWasm(urlBytes.length);
-        const r = wasmRes, s5Val = getUrlParam(r[13], r[14]), httpVal = getUrlParam(r[15], r[16]), nat64Val = getUrlParam(r[17], r[18]), turnVal = getUrlParam(r[22], r[23]), ipVal = getUrlParam(r[19], r[20]), proxyAll = r[21] === 1;
-        !proxyAll && list.push({type: 0});
-        const add = (v, t) => {
-            const parts = v && decodeURIComponent(v).split(',').filter(Boolean);
-            parts?.length && list.push({type: t, param: parts.map(p => t === 4 ? {nat64Auth: p, proxyAll} : p), concurrent: true});
-        };
-        for (const k of proxyStrategyOrder) k === 'socks' ? add(s5Val, 1) : k === 'http' ? add(httpVal, 2) : k === 'turn' ? add(turnVal, 5) : add(nat64Val, 4);
-        if (proxyAll) {
-            !list.length && list.push({type: 0});
+        if (clean.length < 6 || clean.length > 1024) {
+            list.push({type: 0}, {type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost});
         } else {
-            add(ipVal, 3), list.push({type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost});
+            const urlBytes = textEncoder.encode(clean);
+            wasmMem.set(urlBytes, dataPtr);
+            parseUrlWasm(urlBytes.length);
+            const r = wasmRes;
+            const s5Val = getUrlParam(r[13], r[14]), httpVal = getUrlParam(r[15], r[16]), nat64Val = getUrlParam(r[17], r[18]), turnVal = getUrlParam(r[22], r[23]), ipVal = getUrlParam(r[19], r[20]);
+            const proxyAll = r[21] === 1;
+            !proxyAll && list.push({type: 0});
+            const add = (v, t) => {
+                if (!v) return;
+                const parts = decodeURIComponent(v).split(',').filter(Boolean);
+                if (parts.length) {
+                    const parsedParams = parts.map(part => {
+                        if (t === 4) return {nat64Auth: part, proxyAll};
+                        if (t === 1 || t === 2 || t === 5) return parseAuthString(part);
+                        return part;
+                    });
+                    list.push({type: t, param: parsedParams, concurrent: true});
+                }
+            };
+            for (const k of proxyStrategyOrder) k === 'socks' ? add(s5Val, 1) : k === 'http' ? add(httpVal, 2) : k === 'turn' ? add(turnVal, 5) : add(nat64Val, 4);
+            if (proxyAll) {
+                !list.length && list.push({type: 0});
+            } else {
+                add(ipVal, 3);
+                list.push({type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost});
+            }
         }
+        const oldKey = urlListCacheKeys[urlListCacheIndex];
+        if (oldKey !== undefined) delete urlListCacheDict[oldKey];
+        urlListCacheKeys[urlListCacheIndex] = clean;
+        urlListCacheDict[clean] = list;
+        urlListCacheIndex = (urlListCacheIndex + 1) % urlParamCacheLimit;
     }
     for (let i = 0; i < list.length; i++) {
         try {

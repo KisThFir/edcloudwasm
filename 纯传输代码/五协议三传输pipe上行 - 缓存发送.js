@@ -49,6 +49,8 @@ const concurrentOnlyDomain = false;//只对域名并发开关
 /**- **警告**: snippets只能设置为1，worker最大支持6，超过6没意义*/
 let concurrency = 4;//socket获取并发数
 // ---------------------------------------------------------------------------------
+const urlParamCacheLimit = 20;//URL参数解析结果缓存条数
+// ---------------------------------------------------------------------------------
 //四者的socket获取顺序，全局模式下为这四个的顺序，非全局为：直连>socks>http>turn>nat64>proxyip>finallyProxyHost
 /**- **警告**: snippets只支持最大两次connect，所以snippets全局nat64不能使用域名访问，snippets访问cf失败的备用只有第一个有效*/
 const proxyStrategyOrder = ['socks', 'http', 'turn', 'nat64'];
@@ -528,12 +530,10 @@ const strategyExecutorMap = new Map([
         return concurrentConnect(hostname, port, addrType);
     }],
     [1, async ({addrType, port, addrBytes}, param, limit) => {
-        const socksAuth = parseAuthString(param);
-        return connectViaSocksProxy(addrType, port, socksAuth, addrBytes, limit);
+        return connectViaSocksProxy(addrType, port, param, addrBytes, limit);
     }],
     [2, async ({addrType, port, addrBytes}, param, limit) => {
-        const httpAuth = parseAuthString(param);
-        return connectViaHttpProxy(addrType, port, httpAuth, addrBytes, limit);
+        return connectViaHttpProxy(addrType, port, param, addrBytes, limit);
     }],
     [3, async (_parsedRequest, param, limit) => {
         return connectProxyIp(param, limit);
@@ -544,7 +544,6 @@ const strategyExecutorMap = new Map([
     }],
     // @ts-ignore
     [5, async ({addrType, port, addrBytes, isHttp}, param) => {
-        const turnAuth = parseAuthString(param);
         let targetIp = binaryAddrToString(addrType, addrBytes);
         if (isHttp) addrType = addrTypeIs(targetIp);
         if (addrType === 3) {
@@ -552,13 +551,13 @@ const strategyExecutorMap = new Map([
             const aRecord = answer?.find(record => record.type === 1);
             if (!aRecord) return null;
             targetIp = aRecord.data;
-        } else if (addrType === 4) {
-            return null;
-        }
-        return connectViaTurnProxy(turnAuth, targetIp, port);
+        } else if (addrType === 4) {return null}
+        return connectViaTurnProxy(param, targetIp, port);
     }]
 ]);
 const paramRegex = /(gs5|s5all|ghttp|httpall|gnat64|nat64all|gturn|turnall|s5|socks|http|nat64|turn|ip)(?:=|:\/\/|%3A%2F%2F)([^&]+)|(proxyall|globalproxy)/gi;
+const urlListCacheDict = Object.create(null), urlListCacheKeys = new Array(urlParamCacheLimit);
+let urlListCacheIndex = 0;
 const establishTcpConnection = async (parsedRequest, request) => {
     let u = request.url, clean = u.slice(u.indexOf('/', 10) + 1), l = clean.length, list = [];
     if (l > 3 && clean.charCodeAt(l - 4) === 47 && clean.charCodeAt(l - 3) === 84 && clean.charCodeAt(l - 2) === 117 && clean.charCodeAt(l - 1) === 110) {
@@ -567,26 +566,48 @@ const establishTcpConnection = async (parsedRequest, request) => {
         const c = clean.charCodeAt(l - 1);
         if (c === 47 || c === 61) clean = clean.slice(0, l - 1);
     }
-    if (clean.length < 6) {list.push({type: 0}, {type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost})} else {
-        paramRegex.lastIndex = 0;
-        let m, p = Object.create(null);
-        while ((m = paramRegex.exec(clean))) p[(m[1] || m[3]).toLowerCase()] = m[2] ? (m[2].charCodeAt(m[2].length - 1) === 61 ? m[2].slice(0, -1) : m[2]) : true;
-        const s5 = p.gs5 || p.s5all || p.s5 || p.socks, http = p.ghttp || p.httpall || p.http, nat64 = p.gnat64 || p.nat64all || p.nat64, turn = p.gturn || p.turnall || p.turn;
-        const proxyAll = !!(p.gs5 || p.s5all || p.ghttp || p.httpall || p.gnat64 || p.nat64all || p.gturn || p.turnall || p.proxyall || p.globalproxy);
-        if (!proxyAll) list.push({type: 0});
-        const add = (v, t) => {
-            if (!v) return;
-            const parts = decodeURIComponent(v).split(',').filter(Boolean);
-            if (parts.length) list.push({type: t, param: parts.map(part => t === 4 ? {nat64Auth: part, proxyAll} : part), concurrent: true});
-        };
-        for (let i = 0; i < proxyStrategyOrder.length; i++) {
-            const k = proxyStrategyOrder[i];
-            add(k === 'socks' ? s5 : k === 'http' ? http : k === 'turn' ? turn : nat64, k === 'socks' ? 1 : k === 'http' ? 2 : k === 'turn' ? 5 : 4);
+    const cachedList = urlListCacheDict[clean];
+    if (cachedList !== undefined) {
+        list = cachedList;
+    } else {
+        if (clean.length < 6) {
+            list.push({type: 0}, {type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost});
+        } else {
+            const p = Object.create(null);
+            paramRegex.lastIndex = 0;
+            let m;
+            while ((m = paramRegex.exec(clean))) {p[(m[1] || m[3]).toLowerCase()] = m[2] ? (m[2].charCodeAt(m[2].length - 1) === 61 ? m[2].slice(0, -1) : m[2]) : true}
+            const s5 = p.gs5 || p.s5all || p.s5 || p.socks, http = p.ghttp || p.httpall || p.http, nat64 = p.gnat64 || p.nat64all || p.nat64, turn = p.gturn || p.turnall || p.turn;
+            const proxyAll = !!(p.gs5 || p.s5all || p.ghttp || p.httpall || p.gnat64 || p.nat64all || p.gturn || p.turnall || p.proxyall || p.globalproxy);
+            if (!proxyAll) list.push({type: 0});
+            const add = (v, t) => {
+                if (!v) return;
+                const parts = decodeURIComponent(v).split(',').filter(Boolean);
+                if (parts.length) {
+                    const parsedParams = parts.map(part => {
+                        if (t === 4) return {nat64Auth: part, proxyAll};
+                        if (t === 1 || t === 2 || t === 5) return parseAuthString(part);
+                        return part;
+                    });
+                    list.push({type: t, param: parsedParams, concurrent: true});
+                }
+            };
+            for (let i = 0; i < proxyStrategyOrder.length; i++) {
+                const k = proxyStrategyOrder[i];
+                add(k === 'socks' ? s5 : k === 'http' ? http : k === 'turn' ? turn : nat64, k === 'socks' ? 1 : k === 'http' ? 2 : k === 'turn' ? 5 : 4);
+            }
+            if (proxyAll) {
+                if (!list.length) list.push({type: 0});
+            } else {
+                add(p.ip, 3);
+                list.push({type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost});
+            }
         }
-        if (proxyAll) {if (!list.length) list.push({type: 0})} else {
-            add(p.ip, 3);
-            list.push({type: 3, param: coloToProxyMap.get(request.cf?.colo) ?? proxyIpAddrs.US}, {type: 3, param: finallyProxyHost});
-        }
+        const oldKey = urlListCacheKeys[urlListCacheIndex];
+        if (oldKey !== undefined) delete urlListCacheDict[oldKey];
+        urlListCacheKeys[urlListCacheIndex] = clean;
+        urlListCacheDict[clean] = list;
+        urlListCacheIndex = (urlListCacheIndex + 1) % urlParamCacheLimit;
     }
     for (let i = 0; i < list.length; i++) {
         try {
