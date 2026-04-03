@@ -38,7 +38,7 @@ const h = async (w, q) => {
                 for (let j = 1; j < 8; j++) i += ':' + ((k[o + j * 2] << 8) | k[o + j * 2 + 1]).toString(16);
                 b = `[${i}]`
             }
-            const t = await f(b, r).catch(() => {
+            t = await f(b, r).catch(() => {
                 const u = new URL(q.url);
                 const x = u.searchParams.get('ip') ?? m.get(q.cf?.colo) ?? p.US;
                 const [s, w = r] = x.split(":");
