@@ -21,7 +21,7 @@ const startThreshold = 50 * 1024 * 1024; //50MB
 /**- **警告**: 免费worker设置64KB时传输相同流量cpu开销最低。*/
 const maxChunkLen = 64 * 1024;        // 64KB
 /** 进入缓冲模式时的缓冲区发送的触发时间。*/
-const flushTime = 20;                 // 20ms
+const flushTime = 12;                 // 20ms
 // ---------------------------------------------------------------------------------
 /**- **警告**: worker最大支持6，超过6没意义*/
 let concurrency = 4;//socket获取并发数
@@ -623,7 +623,7 @@ const handleSession = async (chunk, state, request, writable, close) => {
     if (parsedRequest.isDns) {
         const dnsPack = await dohDnsHandler(payload);
         if (dnsPack?.byteLength) writable.send(dnsPack);
-        return close();
+        return;
     } else {
         state.tcpSocket = await establishTcpConnection(parsedRequest, request);
         if (!state.tcpSocket) return close();
