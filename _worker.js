@@ -621,8 +621,31 @@ const handleSession = async (chunk, state, request, writable, close) => {
     const parsedRequest = {addrType: r[5], port: r[6], dataOffset: r[7], isDns: r[8] === 1, addrBytes: chunk.subarray(r[9], r[9] + r[10]), isHttp: r[11] === 3};
     const payload = chunk.subarray(parsedRequest.dataOffset);
     if (parsedRequest.isDns) {
-        const dnsPack = await dohDnsHandler(payload);
-        if (dnsPack?.byteLength) writable.send(dnsPack);
+        let dnsBuffer = new Uint8Array(0);
+        // 接管该连接后续所有的 UDP DNS 数据流
+        const processDns = (rawChunk) => {
+            const chunkArray = rawChunk instanceof Uint8Array ? rawChunk : new Uint8Array(rawChunk);
+            if (chunkArray.length > 0) dnsBuffer = cat(dnsBuffer, chunkArray);
+            
+            // 循环拆解长度前缀 (VLESS/Trojan UDP 封包规范：2字节长度 + payload)
+            while (dnsBuffer.length >= 2) {
+                const udpSize = (dnsBuffer[0] << 8) | dnsBuffer[1];
+                if (dnsBuffer.length >= 2 + udpSize) {
+                    const packet = dnsBuffer.subarray(0, 2 + udpSize);
+                    dnsBuffer = dnsBuffer.subarray(2 + udpSize);
+                    // 并发处理 DoH，避免阻塞后续包的读取
+                    dohDnsHandler(packet).then(dnsPack => {
+                        if (dnsPack?.byteLength) writable.send(dnsPack);
+                    }).catch(() => {});
+                } else {
+                    break;
+                }
+            }
+        };
+        // 处理第一个携带在 Header 里的 payload
+        processDns(payload);
+        // 将连接后续的流量全部引导至我们的 DNS 处理器
+        state.tcpWriter = processDns;
         return;
     } else {
         state.tcpSocket = await establishTcpConnection(parsedRequest, request);
