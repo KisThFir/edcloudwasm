@@ -627,7 +627,7 @@ const handleSession = async (chunk, state, request, writable, close) => {
             const chunkArray = rawChunk instanceof Uint8Array ? rawChunk : new Uint8Array(rawChunk);
             if (chunkArray.length > 0) dnsBuffer = cat(dnsBuffer, chunkArray);
             
-            // 循环拆解长度前缀 (VLESS/Trojan UDP 封包规范：2字节长度 + payload)
+            // 循环拆解长度前缀 (UDP 封包规范：2字节长度 + payload)
             while (dnsBuffer.length >= 2) {
                 const udpSize = (dnsBuffer[0] << 8) | dnsBuffer[1];
                 if (dnsBuffer.length >= 2 + udpSize) {
