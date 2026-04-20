@@ -21,7 +21,7 @@ const startThreshold = 50 * 1024 * 1024; //50MB
 /**- **警告**: 免费worker设置64KB时传输相同流量cpu开销最低。*/
 const maxChunkLen = 64 * 1024;        // 64KB
 /** 进入缓冲模式时的缓冲区发送的触发时间。*/
-const flushTime = 20;                 // 20ms
+const flushTime = 20;                 
 // ---------------------------------------------------------------------------------
 /**- **警告**: worker最大支持6，超过6没意义*/
 let concurrency = 4;//socket获取并发数
@@ -624,9 +624,32 @@ const handleSession = async (chunk, state, request, writable, close) => {
     const parsedRequest = {addrType: r[5], port: r[6], dataOffset: r[7], isDns: r[8] === 1, addrBytes: chunk.subarray(r[9], r[9] + r[10]), isHttp: r[11] === 3};
     const payload = chunk.subarray(parsedRequest.dataOffset);
     if (parsedRequest.isDns) {
-        const dnsPack = await dohDnsHandler(payload);
-        if (dnsPack?.byteLength) writable.send(dnsPack);
-        return close();
+        let dnsBuffer = new Uint8Array(0);
+        // 接管该连接后续所有的 UDP DNS 数据流
+        const processDns = (rawChunk) => {
+            const chunkArray = rawChunk instanceof Uint8Array ? rawChunk : new Uint8Array(rawChunk);
+            if (chunkArray.length > 0) dnsBuffer = cat(dnsBuffer, chunkArray);
+            
+            // 循环拆解长度前缀 UDP 封包规范：2字节长度 + payload)
+            while (dnsBuffer.length >= 2) {
+                const udpSize = (dnsBuffer[0] << 8) | dnsBuffer[1];
+                if (dnsBuffer.length >= 2 + udpSize) {
+                    const packet = dnsBuffer.subarray(0, 2 + udpSize);
+                    dnsBuffer = dnsBuffer.subarray(2 + udpSize);
+                    // 并发处理 DoH，避免阻塞后续包的读取
+                    dohDnsHandler(packet).then(dnsPack => {
+                        if (dnsPack?.byteLength) writable.send(dnsPack);
+                    }).catch(() => {});
+                } else {
+                    break;
+                }
+            }
+        };
+        // 处理第一个携带在 Header 里的 payload
+        processDns(payload);
+        // 将连接后续的流量全部引导至我们的 DNS 处理器
+        state.tcpWriter = processDns;
+        return;
     } else {
         state.tcpSocket = await establishTcpConnection(parsedRequest, request);
         if (!state.tcpSocket) return close();
